@@ -1,6 +1,6 @@
 FROM ghcr.io/home-assistant/amd64-base:latest
 
-RUN apk add --no-cache bash python3 py3-pillow py3-psutil font-dejavu
+RUN apk add --no-cache bash python3 py3-pillow py3-psutil font-dejavu jq
 
 COPY run.sh /
 COPY app.py /

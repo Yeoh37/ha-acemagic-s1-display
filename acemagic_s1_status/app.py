@@ -1,241 +1,111 @@
-import json
-import os
-import time
-from datetime import datetime
-from pathlib import Path
-
+import json, os, time, struct, glob, traceback
 import psutil
-import usb1
 from PIL import Image, ImageDraw, ImageFont
 
-WIDTH = 320
-HEIGHT = 170
-PACKET_SIZE = 4104
-PAYLOAD_SIZE = 4096
-VID = 0x04D9
-PID = 0xFD01
-INTERFACE = 1
-ENDPOINT_OUT = 0x02
-
+WIDTH, HEIGHT = 320, 170
 FONT_BOLD = "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"
 FONT_REG = "/usr/share/fonts/dejavu/DejaVuSans.ttf"
 
 
-def load_options():
-    defaults = {
-        "refresh_seconds": 2,
-        "hidraw_device": "/dev/hidraw1",
-        "orientation": "landscape",
-        "backend": "libusb1",
-    }
+def opts():
     try:
-        with open("/data/options.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        defaults.update(data)
-    except Exception as exc:
-        print(f"Options par defaut utilisees: {exc}", flush=True)
-    return defaults
+        with open('/data/options.json') as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-def packet(header, payload=b""):
-    data = bytes(header) + bytes(payload)
-    if len(data) > PACKET_SIZE:
-        raise ValueError(f"Paquet trop grand: {len(data)}")
-    return data + bytes(PACKET_SIZE - len(data))
-
-
-def rgb565_be(image):
-    image = image.convert("RGB")
-    out = bytearray(WIDTH * HEIGHT * 2)
-    pos = 0
-    for r, g, b in image.getdata():
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        # Documentation communautaire: RGB565 big-endian.
-        out[pos] = (value >> 8) & 0xFF
-        out[pos + 1] = value & 0xFF
-        pos += 2
+def img_rgb565(img):
+    img = img.convert('RGB')
+    out = bytearray()
+    for r,g,b in img.getdata():
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out += bytes([(v >> 8) & 255, v & 255])
     return bytes(out)
 
 
-def rgb565_le(image):
-    image = image.convert("RGB")
-    out = bytearray(WIDTH * HEIGHT * 2)
-    pos = 0
-    for r, g, b in image.getdata():
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out[pos] = value & 0xFF
-        out[pos + 1] = (value >> 8) & 0xFF
-        pos += 2
-    return bytes(out)
-
-
-def make_image():
-    cpu = psutil.cpu_percent(interval=0.25)
-    vm = psutil.virtual_memory()
-    used_gb = vm.used / (1024 ** 3)
-    total_gb = vm.total / (1024 ** 3)
-
-    img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    big = ImageFont.truetype(FONT_BOLD, 28)
-    mid = ImageFont.truetype(FONT_BOLD, 24)
-    small = ImageFont.truetype(FONT_REG, 18)
-    tiny = ImageFont.truetype(FONT_REG, 14)
-
-    green = (0, 255, 80)
-    white = (235, 235, 235)
-    blue = (110, 180, 255)
-    gray = (150, 150, 150)
-
-    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=(0, 80, 30))
-    draw.text((18, 16), "HOME ASSISTANT", fill=green, font=big)
-    draw.text((128, 54), "OK", fill=green, font=mid)
-    draw.text((45, 84), "EN FONCTIONNEMENT", fill=white, font=small)
-    draw.text((28, 118), f"CPU {cpu:>3.0f} %", fill=white, font=small)
-    draw.text((28, 142), f"RAM {used_gb:.1f}/{total_gb:.0f} Go", fill=white, font=small)
-    draw.text((224, 142), datetime.now().strftime("%H:%M"), fill=blue, font=small)
-    draw.text((230, 118), "S1 LCD", fill=gray, font=tiny)
+def make_image(orientation='landscape'):
+    cpu = psutil.cpu_percent(interval=0.2)
+    mem = psutil.virtual_memory()
+    img = Image.new('RGB', (WIDTH, HEIGHT), (0,0,0))
+    d = ImageDraw.Draw(img)
+    f1 = ImageFont.truetype(FONT_BOLD, 28)
+    f2 = ImageFont.truetype(FONT_BOLD, 22)
+    f3 = ImageFont.truetype(FONT_REG, 18)
+    d.text((20, 16), 'HOME ASSISTANT', fill=(0,255,80), font=f1)
+    d.text((112, 54), 'OK', fill=(0,255,80), font=f1)
+    d.text((42, 88), 'EN FONCTIONNEMENT', fill=(0,200,255), font=f2)
+    d.text((32, 124), f'CPU {cpu:.0f} %', fill=(230,230,230), font=f3)
+    d.text((160, 124), f'RAM {mem.used/1024**3:.1f}/{mem.total/1024**3:.0f} Go', fill=(230,230,230), font=f3)
+    if orientation == 'portrait':
+        img = img.rotate(90, expand=True).resize((WIDTH, HEIGHT))
     return img
 
 
-class LibUsb1Writer:
-    def __init__(self):
-        self.ctx = usb1.USBContext()
-        print("Recherche USB 04D9:FD01", flush=True)
-        self.handle = self.ctx.openByVendorIDAndProductID(VID, PID)
-        if self.handle is None:
-            raise RuntimeError("USB 04D9:FD01 introuvable")
+def write_packet(path, packet):
+    with open(path, 'wb', buffering=0) as f:
+        return f.write(packet)
+
+
+def send_hid(path, image, mode='auto'):
+    raw = img_rgb565(image)
+    print(f'HIDRAW: {path}, mode={mode}, image={len(raw)} bytes', flush=True)
+
+    # Variantes: certains pilotes attendent un report ID 0x00, d'autres non.
+    modes = ['raw4104','report4105','short64'] if mode == 'auto' else [mode]
+
+    for m in modes:
         try:
-            self.handle.detachKernelDriver(INTERFACE)
-            print("Kernel driver detache de l'interface 1", flush=True)
-        except Exception as exc:
-            print(f"Info detach interface 1: {exc}", flush=True)
-        self.handle.claimInterface(INTERFACE)
-        print("Interface USB 1 revendiquee, endpoint OUT 0x02", flush=True)
+            print(f'Test mode {m}', flush=True)
+            # init/orientation candidates
+            init_packets = [
+                bytes([0x55,0xA1,0xF1,0x01]) + bytes(4100),
+                bytes([0x55,0xA1,0xF2,0x01]) + bytes(4100),
+                bytes([0x00,0x55,0xA1,0xF1,0x01]) + bytes(4100),
+                bytes([0x00,0x55,0xA1,0xF2,0x01]) + bytes(4100),
+            ]
+            for p in init_packets:
+                try: write_packet(path, p)
+                except Exception as e: print(f'Init ignore: {e}', flush=True)
 
-    def write(self, data):
-        # Custom HID: pas de report ID, paquet fixe 4104 octets.
-        self.handle.interruptWrite(ENDPOINT_OUT, bytes(data), timeout=3000)
-
-    def close(self):
-        try:
-            self.handle.releaseInterface(INTERFACE)
-        except Exception:
-            pass
-        try:
-            self.handle.close()
-        except Exception:
-            pass
-        try:
-            self.ctx.close()
-        except Exception:
-            pass
-
-
-class HidrawWriter:
-    def __init__(self, device):
-        self.device = device
-        if not Path(device).exists():
-            raise FileNotFoundError(device)
-        print(f"HIDRAW utilise: {device}", flush=True)
-
-    def write(self, data):
-        with open(self.device, "wb", buffering=0) as f:
-            f.write(data)
-
-    def close(self):
-        pass
-
-
-def send_orientation(writer, orientation):
-    if orientation == "auto":
-        orientation = "landscape"
-    value = 0x01 if orientation == "landscape" else 0x02
-    writer.write(packet([0x55, 0xA1, 0xF1, value]))
-    print(f"Orientation envoyee: {orientation}", flush=True)
-
-
-def send_heartbeat(writer):
-    now = datetime.now()
-    writer.write(packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second]))
-
-
-def send_image(writer, image, endian="be"):
-    data = rgb565_be(image) if endian == "be" else rgb565_le(image)
-    total_chunks = (len(data) + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
-    offset = 0
-    seq = 0
-    while offset < len(data):
-        chunk = data[offset:offset + PAYLOAD_SIZE]
-        # Format simple documente par les projets communautaires: 55 A3 + index + total + longueur + padding.
-        header = [
-            0x55, 0xA3,
-            seq & 0xFF,
-            total_chunks & 0xFF,
-            len(chunk) & 0xFF,
-            (len(chunk) >> 8) & 0xFF,
-            0x00,
-            0x00,
-        ]
-        writer.write(packet(header, chunk))
-        offset += len(chunk)
-        seq += 1
-        time.sleep(0.003)
-
-
-def send_image_alt(writer, image, endian="be"):
-    data = rgb565_be(image) if endian == "be" else rgb565_le(image)
-    offset = 0
-    seq = 1
-    while offset < len(data):
-        chunk = data[offset:offset + PAYLOAD_SIZE]
-        subcmd = 0xF0 if offset == 0 else (0xF2 if offset + PAYLOAD_SIZE >= len(data) else 0xF1)
-        off16 = offset & 0xFFFF
-        blocks = (len(chunk) + 255) // 256
-        header = [0x55, 0xA3, subcmd, seq & 0xFF, off16 & 0xFF, (off16 >> 8) & 0xFF, blocks & 0xFF, (blocks >> 8) & 0xFF]
-        writer.write(packet(header, chunk))
-        offset += len(chunk)
-        seq += 1
-        time.sleep(0.003)
+            chunks = [raw[i:i+4096] for i in range(0, len(raw), 4096)]
+            for i,ch in enumerate(chunks):
+                header = bytes([0x55,0xA3, i & 255, len(chunks) & 255, len(ch)&255, (len(ch)>>8)&255, 0, 0])
+                pkt = header + ch
+                if m == 'raw4104':
+                    pkt = pkt.ljust(4104, b'\x00')
+                elif m == 'report4105':
+                    pkt = (b'\x00' + pkt).ljust(4105, b'\x00')
+                elif m == 'short64':
+                    # split en rapports de 64 bytes precedes par report ID 0
+                    pkt = pkt
+                    for j in range(0, len(pkt), 63):
+                        write_packet(path, (b'\x00' + pkt[j:j+63]).ljust(64, b'\x00'))
+                    continue
+                write_packet(path, pkt)
+            print(f'Mode {m}: envoi termine', flush=True)
+            time.sleep(0.3)
+        except Exception as e:
+            print(f'Mode {m}: erreur {e}', flush=True)
+            traceback.print_exc()
 
 
 def main():
-    print("ACEMAGIC S1 Status - demarrage v1.0.5", flush=True)
-    print("Peripheriques HID disponibles:", flush=True)
-    os.system("ls -l /dev/hidraw* 2>/dev/null || true")
+    o = opts()
+    refresh = int(o.get('refresh_seconds',10))
+    dev = o.get('hidraw_device','/dev/hidraw1')
+    orientation = o.get('orientation','landscape')
+    mode = o.get('packet_mode','auto')
+    print('ACEMAGIC S1 Status v1.0.6', flush=True)
+    print(f'Device={dev}, refresh={refresh}, orientation={orientation}, packet_mode={mode}', flush=True)
+    print('HID disponibles: ' + ', '.join(glob.glob('/dev/hidraw*')), flush=True)
+    while True:
+        try:
+            send_hid(dev, make_image(orientation), mode)
+        except Exception as e:
+            print(f'Erreur generale: {e}', flush=True)
+            traceback.print_exc()
+        time.sleep(refresh)
 
-    opts = load_options()
-    refresh = max(1, int(opts.get("refresh_seconds", 2)))
-    orientation = opts.get("orientation", "landscape")
-    backend = opts.get("backend", "libusb1")
-    print(f"Backend: {backend}", flush=True)
-    print(f"Rafraichissement: {refresh} s", flush=True)
-
-    if backend == "hidraw":
-        writer = HidrawWriter(opts.get("hidraw_device", "/dev/hidraw1"))
-    else:
-        writer = LibUsb1Writer()
-
-    try:
-        send_orientation(writer, orientation)
-        time.sleep(0.2)
-        while True:
-            try:
-                img = make_image()
-                send_heartbeat(writer)
-                # Les firmwares S1 ne reagissent pas tous au meme header: on envoie les deux variantes.
-                send_image(writer, img, endian="be")
-                time.sleep(0.1)
-                send_image_alt(writer, img, endian="be")
-                send_heartbeat(writer)
-                print("Image envoyee au LCD", flush=True)
-            except Exception as exc:
-                print(f"Erreur LCD: {type(exc).__name__}: {exc}", flush=True)
-            time.sleep(refresh)
-    finally:
-        writer.close()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

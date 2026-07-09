@@ -1,5 +1,5 @@
-# ACEMAGIC S1 Display
+# ACEMAGIC S1 Display for Home Assistant
 
-Application Home Assistant pour tester l'affichage du LCD ACEMAGIC S1.
+Application Home Assistant pour tenter d'afficher l'etat Home Assistant sur l'ecran integre ACEMAGIC S1.
 
-Version 1.0.9 : package nettoyé, compatible magasin d'applications Home Assistant, mode HIDRAW uniquement.
+Version 1.1.0 : tentative libusb avec unbind temporaire de l'interface usbhid.

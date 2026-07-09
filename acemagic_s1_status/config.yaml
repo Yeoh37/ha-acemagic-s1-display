@@ -1,5 +1,5 @@
 name: ACEMAGIC S1 Status
-version: "1.0.9"
+version: "1.1.0"
 slug: acemagic_s1_status
 description: Affiche Home Assistant OK avec CPU et RAM sur l'ecran LCD ACEMAGIC S1
 url: https://github.com/Yeoh37/ha-acemagic-s1-display
@@ -8,19 +8,28 @@ arch:
 startup: services
 boot: auto
 init: false
-udev: true
+full_access: true
 privileged:
+  - SYS_ADMIN
   - SYS_RAWIO
+  - DAC_READ_SEARCH
+  - NET_ADMIN
 devices:
   - /dev/hidraw0
   - /dev/hidraw1
+  - /dev/bus/usb
+map:
+  - type: homeassistant_config
+    read_only: false
 options:
   refresh_seconds: 10
+  backend: auto
   hidraw_device: /dev/hidraw1
   orientation: landscape
-  packet_mode: ht32_auto
+  unbind_usbhid: true
 schema:
   refresh_seconds: int
+  backend: list(auto|libusb|hidraw)
   hidraw_device: str
   orientation: list(landscape|portrait)
-  packet_mode: list(ht32_auto|ht32_a3|ht32_f1f2_a3|diagnostic)
+  unbind_usbhid: bool

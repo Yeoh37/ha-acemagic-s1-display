@@ -5,9 +5,7 @@ RUN apk add --no-cache \
     python3 \
     py3-pillow \
     py3-psutil \
-    font-dejavu \
-    jq \
-    eudev-libs
+    font-dejavu
 
 COPY run.sh /
 COPY app.py /

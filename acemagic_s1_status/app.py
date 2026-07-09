@@ -1,173 +1,177 @@
-import glob
 import json
 import os
-import struct
 import time
 from datetime import datetime
+from pathlib import Path
 
 import psutil
 from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 320
 HEIGHT = 170
-VID_HEX = "04d9"
-PID_HEX = "fd01"
+PACKET_SIZE = 4104
+PAYLOAD_SIZE = 4096
 
 FONT_BOLD = "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"
 FONT_REG = "/usr/share/fonts/dejavu/DejaVuSans.ttf"
 
 
 def load_options():
-    options = {"refresh_seconds": 10, "device_path": "auto", "rotate": "0"}
+    defaults = {
+        "refresh_seconds": 10,
+        "hidraw_device": "auto",
+        "orientation": "landscape",
+    }
     try:
         with open("/data/options.json", "r", encoding="utf-8") as f:
-            options.update(json.load(f))
-    except Exception as e:
-        print(f"Options par defaut utilisees: {e}")
-    return options
+            data = json.load(f)
+        defaults.update(data)
+    except Exception as exc:
+        print(f"Options par defaut utilisees: {exc}", flush=True)
+    return defaults
 
 
-def find_hidraw_devices():
-    found = []
-    for path in sorted(glob.glob("/dev/hidraw*")):
-        name = os.path.basename(path)
-        sys_nodes = glob.glob(f"/sys/class/hidraw/{name}/device")
-        for node in sys_nodes:
-            uevent_path = os.path.join(node, "uevent")
-            try:
-                with open(uevent_path, "r", encoding="utf-8", errors="ignore") as f:
-                    data = f.read().lower()
-                if VID_HEX in data and PID_HEX in data:
-                    found.append(path)
-            except Exception:
-                pass
-    return found
+def detect_hidraw(preferred):
+    if preferred and preferred != "auto":
+        if Path(preferred).exists():
+            print(f"Peripherique HID configure: {preferred}", flush=True)
+            return preferred
+        print(f"Peripherique configure absent: {preferred}", flush=True)
+
+    # Sur le S1, l'interface vendor-defined est generalement hidraw1.
+    for dev in ["/dev/hidraw1", "/dev/hidraw0"]:
+        if Path(dev).exists():
+            print(f"Peripherique HID selectionne: {dev}", flush=True)
+            return dev
+    raise FileNotFoundError("Aucun /dev/hidraw0 ou /dev/hidraw1 trouve")
 
 
-def make_status_image(rotate=0):
-    cpu = psutil.cpu_percent(interval=0.3)
+def packet(header, payload=b""):
+    data = bytes(header) + bytes(payload)
+    if len(data) > PACKET_SIZE:
+        raise ValueError("Paquet HID trop grand")
+    return data + bytes(PACKET_SIZE - len(data))
+
+
+def write_packet(device_path, data):
+    with open(device_path, "wb", buffering=0) as dev:
+        dev.write(data)
+
+
+def send_orientation(device_path, orientation):
+    # 0x01 = landscape, 0x02 = portrait d'apres la doc reverse-engineered.
+    value = 0x01 if orientation == "landscape" else 0x02
+    write_packet(device_path, packet([0x55, 0xA1, 0xF1, value, 0x00, 0x00, 0x00, 0x00]))
+    print(f"Orientation envoyee: {orientation}", flush=True)
+
+
+def send_heartbeat(device_path):
+    now = datetime.now()
+    write_packet(device_path, packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second, 0x00, 0x00]))
+
+
+def rgb565_swapped(image):
+    # Le LCD attend RGB565 avec endian swap.
+    image = image.convert("RGB")
+    out = bytearray(WIDTH * HEIGHT * 2)
+    pos = 0
+    for r, g, b in image.getdata():
+        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        # endian swap: octet bas puis octet haut
+        out[pos] = value & 0xFF
+        out[pos + 1] = (value >> 8) & 0xFF
+        pos += 2
+    return bytes(out)
+
+
+def make_image():
+    cpu = psutil.cpu_percent(interval=0.4)
     vm = psutil.virtual_memory()
     used_gb = vm.used / (1024 ** 3)
     total_gb = vm.total / (1024 ** 3)
 
     img = Image.new("RGB", (WIDTH, HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(img)
+
     big = ImageFont.truetype(FONT_BOLD, 28)
-    med = ImageFont.truetype(FONT_BOLD, 22)
+    mid = ImageFont.truetype(FONT_BOLD, 22)
     small = ImageFont.truetype(FONT_REG, 18)
-    tiny = ImageFont.truetype(FONT_REG, 15)
+    tiny = ImageFont.truetype(FONT_REG, 14)
 
-    draw.rounded_rectangle((6, 6, WIDTH - 6, HEIGHT - 6), radius=12, outline=(0, 130, 60), width=2)
-    draw.text((25, 20), "HOME ASSISTANT", fill=(0, 255, 90), font=big)
-    draw.text((118, 58), "OK", fill=(0, 255, 90), font=med)
-    draw.text((60, 84), "EN FONCTIONNEMENT", fill=(210, 255, 220), font=tiny)
-    draw.text((34, 112), f"CPU  {cpu:4.0f} %", fill=(235, 235, 235), font=small)
-    draw.text((34, 138), f"RAM  {used_gb:.1f} / {total_gb:.0f} Go", fill=(235, 235, 235), font=small)
-    draw.text((225, 138), datetime.now().strftime("%H:%M"), fill=(150, 200, 255), font=small)
+    green = (0, 255, 80)
+    white = (235, 235, 235)
+    blue = (110, 180, 255)
+    gray = (150, 150, 150)
 
-    if rotate:
-        img = img.rotate(int(rotate), expand=True)
-        img = img.resize((WIDTH, HEIGHT))
+    draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=(0, 80, 30))
+    draw.text((18, 16), "HOME ASSISTANT", fill=green, font=big)
+    draw.text((116, 55), "OK", fill=green, font=mid)
+    draw.text((45, 82), "EN FONCTIONNEMENT", fill=white, font=small)
+
+    draw.text((28, 116), f"CPU {cpu:>3.0f} %", fill=white, font=small)
+    draw.text((28, 140), f"RAM {used_gb:.1f}/{total_gb:.0f} Go", fill=white, font=small)
+    draw.text((224, 140), datetime.now().strftime("%H:%M"), fill=blue, font=small)
+    draw.text((230, 116), "S1 LCD", fill=gray, font=tiny)
+
     return img
 
 
-def rgb565_le(img):
-    img = img.convert("RGB")
-    out = bytearray()
-    for r, g, b in img.getdata():
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out.append(value & 0xFF)
-        out.append((value >> 8) & 0xFF)
-    return bytes(out)
+def redraw(device_path, image):
+    data = rgb565_swapped(image)
+    total = len(data)
+    seq = 1
+    offset = 0
 
-
-def rgb565_be(img):
-    img = img.convert("RGB")
-    out = bytearray()
-    for r, g, b in img.getdata():
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out.append((value >> 8) & 0xFF)
-        out.append(value & 0xFF)
-    return bytes(out)
-
-
-def write_packets(path, payload, mode):
-    # Plusieurs firmwares du S1 existent. Ces modes permettent de tester sans modifier l'add-on.
-    # Le plus courant pour les ecrans HID est un envoi en report de 64 octets.
-    with open(path, "wb", buffering=0) as dev:
-        if mode == "raw64":
-            for i in range(0, len(payload), 63):
-                chunk = payload[i:i+63]
-                dev.write(bytes([0x00]) + chunk + bytes(63 - len(chunk)))
-        elif mode == "magic55_64":
-            total = (len(payload) + 55) // 56
-            for idx in range(total):
-                chunk = payload[idx*56:(idx+1)*56]
-                header = bytes([0x00, 0x55, 0xA3, idx & 0xFF, (idx >> 8) & 0xFF, total & 0xFF, (total >> 8) & 0xFF, len(chunk)])
-                dev.write(header + chunk + bytes(64 - len(header) - len(chunk)))
-        elif mode == "magic55_4096":
-            total = (len(payload) + 4095) // 4096
-            for idx in range(total):
-                chunk = payload[idx*4096:(idx+1)*4096]
-                header = bytes([0x00, 0x55, 0xA3, idx & 0xFF, total & 0xFF, len(chunk) & 0xFF, (len(chunk) >> 8) & 0xFF, 0x00])
-                dev.write(header + chunk)
+    while offset < total:
+        chunk = data[offset:offset + PAYLOAD_SIZE]
+        if offset == 0:
+            subcmd = 0xF0
+        elif offset + PAYLOAD_SIZE >= total:
+            subcmd = 0xF2
         else:
-            raise ValueError(f"Mode inconnu: {mode}")
+            subcmd = 0xF1
 
+        off16 = offset & 0xFFFF
+        length_words = len(chunk) // 256  # doc: 0x10 pour 4096, 0x09 pour 2304
+        if len(chunk) % 256:
+            length_words += 1
 
-def send_image(path, img):
-    candidates = [
-        ("rgb565_le", rgb565_le(img)),
-        ("rgb565_be", rgb565_be(img)),
-    ]
-    packet_modes = ["magic55_64", "raw64", "magic55_4096"]
-
-    last_error = None
-    for fmt, payload in candidates:
-        for mode in packet_modes:
-            try:
-                print(f"Tentative envoi: device={path} format={fmt} mode={mode} taille={len(payload)}")
-                write_packets(path, payload, mode)
-                print("Envoi termine sans erreur d'ecriture")
-                return True
-            except Exception as e:
-                last_error = e
-                print(f"Echec {fmt}/{mode}: {e}")
-    print(f"Aucun mode d'envoi n'a fonctionne. Derniere erreur: {last_error}")
-    return False
+        header = [
+            0x55, 0xA3, subcmd, seq & 0xFF,
+            off16 & 0xFF, (off16 >> 8) & 0xFF,
+            length_words & 0xFF, (length_words >> 8) & 0xFF,
+        ]
+        write_packet(device_path, packet(header, chunk))
+        offset += len(chunk)
+        seq += 1
+        time.sleep(0.01)
 
 
 def main():
-    options = load_options()
-    refresh = max(2, int(options.get("refresh_seconds", 10)))
-    configured_path = str(options.get("device_path", "auto"))
-    rotate = int(options.get("rotate", 0))
+    opts = load_options()
+    refresh = max(2, int(opts.get("refresh_seconds", 10)))
+    orientation = opts.get("orientation", "landscape")
+    if orientation == "auto":
+        orientation = "landscape"
 
-    print(f"Rafraichissement: {refresh} secondes")
-    print(f"Chemin configure: {configured_path}")
+    device = detect_hidraw(opts.get("hidraw_device", "auto"))
+    print(f"Rafraichissement: {refresh} s", flush=True)
+
+    try:
+        send_orientation(device, orientation)
+        time.sleep(0.2)
+    except Exception as exc:
+        print(f"Orientation non envoyee: {exc}", flush=True)
 
     while True:
-        if configured_path != "auto":
-            devices = [configured_path]
-        else:
-            devices = find_hidraw_devices()
-            if not devices:
-                devices = sorted(glob.glob("/dev/hidraw*"))
-
-        print(f"Peripheriques candidats: {devices}")
-        img = make_status_image(rotate=rotate)
-
-        ok = False
-        for dev in devices:
-            ok = send_image(dev, img)
-            if ok:
-                break
-
-        if ok:
-            print("Mise a jour ecran demandee")
-        else:
-            print("Ecran non mis a jour. Voir les erreurs ci-dessus.")
-
+        try:
+            send_heartbeat(device)
+            img = make_image()
+            redraw(device, img)
+            send_heartbeat(device)
+            print("Image envoyee au LCD", flush=True)
+        except Exception as exc:
+            print(f"Erreur LCD: {exc}", flush=True)
         time.sleep(refresh)
 
 

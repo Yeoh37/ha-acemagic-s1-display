@@ -13,5 +13,10 @@ Affichage prévu :
 Matériel ciblé : écran LCD USB HID `04D9:FD01` du ACEMAGIC S1.
 
 
-## v1.0.3
+## v1.0.4
 Ajout du mode USB direct libusb sur interface 1 / endpoint 0x02.
+
+
+## 1.0.4
+
+Corrige la construction Docker: installation de PyUSB via pip car le paquet Alpine py3-pyusb est absent dans cette image.

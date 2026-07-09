@@ -1,5 +1,5 @@
-# ACEMAGIC S1 Display for Home Assistant
+# ACEMAGIC S1 Display
 
-Affiche Home Assistant OK, CPU et RAM sur le LCD interne ACEMAGIC S1.
+Application Home Assistant pour tester l'affichage du LCD ACEMAGIC S1.
 
-Version 1.0.8 : tentative d'accès renforcé USB/libusb avec fallback hidraw.
+Version 1.0.9 : package nettoyé, compatible magasin d'applications Home Assistant, mode HIDRAW uniquement.

@@ -5,14 +5,17 @@ from datetime import datetime
 from pathlib import Path
 
 import psutil
-import usb.core
-import usb.util
+import usb1
 from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 320
 HEIGHT = 170
 PACKET_SIZE = 4104
 PAYLOAD_SIZE = 4096
+VID = 0x04D9
+PID = 0xFD01
+INTERFACE = 1
+ENDPOINT_OUT = 0x02
 
 FONT_BOLD = "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"
 FONT_REG = "/usr/share/fonts/dejavu/DejaVuSans.ttf"
@@ -20,10 +23,10 @@ FONT_REG = "/usr/share/fonts/dejavu/DejaVuSans.ttf"
 
 def load_options():
     defaults = {
-        "refresh_seconds": 10,
-        "hidraw_device": "auto",
+        "refresh_seconds": 2,
+        "hidraw_device": "/dev/hidraw1",
         "orientation": "landscape",
-        "backend": "usb",
+        "backend": "libusb1",
     }
     try:
         with open("/data/options.json", "r", encoding="utf-8") as f:
@@ -34,53 +37,32 @@ def load_options():
     return defaults
 
 
-def detect_hidraw(preferred):
-    if preferred and preferred != "auto":
-        if Path(preferred).exists():
-            print(f"Peripherique HID configure: {preferred}", flush=True)
-            return preferred
-        print(f"Peripherique configure absent: {preferred}", flush=True)
-
-    # Sur le S1, l'interface vendor-defined est generalement hidraw1.
-    for dev in ["/dev/hidraw1", "/dev/hidraw0"]:
-        if Path(dev).exists():
-            print(f"Peripherique HID selectionne: {dev}", flush=True)
-            return dev
-    raise FileNotFoundError("Aucun /dev/hidraw0 ou /dev/hidraw1 trouve")
-
-
 def packet(header, payload=b""):
     data = bytes(header) + bytes(payload)
     if len(data) > PACKET_SIZE:
-        raise ValueError("Paquet HID trop grand")
+        raise ValueError(f"Paquet trop grand: {len(data)}")
     return data + bytes(PACKET_SIZE - len(data))
 
 
-def write_packet(device_path, data):
-    with open(device_path, "wb", buffering=0) as dev:
-        dev.write(data)
-
-
-def send_orientation(device_path, orientation):
-    # 0x01 = landscape, 0x02 = portrait d'apres la doc reverse-engineered.
-    value = 0x01 if orientation == "landscape" else 0x02
-    write_packet(device_path, packet([0x55, 0xA1, 0xF1, value, 0x00, 0x00, 0x00, 0x00]))
-    print(f"Orientation envoyee: {orientation}", flush=True)
-
-
-def send_heartbeat(device_path):
-    now = datetime.now()
-    write_packet(device_path, packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second, 0x00, 0x00]))
-
-
-def rgb565_swapped(image):
-    # Le LCD attend RGB565 avec endian swap.
+def rgb565_be(image):
     image = image.convert("RGB")
     out = bytearray(WIDTH * HEIGHT * 2)
     pos = 0
     for r, g, b in image.getdata():
         value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        # endian swap: octet bas puis octet haut
+        # Documentation communautaire: RGB565 big-endian.
+        out[pos] = (value >> 8) & 0xFF
+        out[pos + 1] = value & 0xFF
+        pos += 2
+    return bytes(out)
+
+
+def rgb565_le(image):
+    image = image.convert("RGB")
+    out = bytearray(WIDTH * HEIGHT * 2)
+    pos = 0
+    for r, g, b in image.getdata():
+        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
         out[pos] = value & 0xFF
         out[pos + 1] = (value >> 8) & 0xFF
         pos += 2
@@ -88,7 +70,7 @@ def rgb565_swapped(image):
 
 
 def make_image():
-    cpu = psutil.cpu_percent(interval=0.4)
+    cpu = psutil.cpu_percent(interval=0.25)
     vm = psutil.virtual_memory()
     used_gb = vm.used / (1024 ** 3)
     total_gb = vm.total / (1024 ** 3)
@@ -97,7 +79,7 @@ def make_image():
     draw = ImageDraw.Draw(img)
 
     big = ImageFont.truetype(FONT_BOLD, 28)
-    mid = ImageFont.truetype(FONT_BOLD, 22)
+    mid = ImageFont.truetype(FONT_BOLD, 24)
     small = ImageFont.truetype(FONT_REG, 18)
     tiny = ImageFont.truetype(FONT_REG, 14)
 
@@ -108,156 +90,151 @@ def make_image():
 
     draw.rectangle((0, 0, WIDTH - 1, HEIGHT - 1), outline=(0, 80, 30))
     draw.text((18, 16), "HOME ASSISTANT", fill=green, font=big)
-    draw.text((116, 55), "OK", fill=green, font=mid)
-    draw.text((45, 82), "EN FONCTIONNEMENT", fill=white, font=small)
-
-    draw.text((28, 116), f"CPU {cpu:>3.0f} %", fill=white, font=small)
-    draw.text((28, 140), f"RAM {used_gb:.1f}/{total_gb:.0f} Go", fill=white, font=small)
-    draw.text((224, 140), datetime.now().strftime("%H:%M"), fill=blue, font=small)
-    draw.text((230, 116), "S1 LCD", fill=gray, font=tiny)
-
+    draw.text((128, 54), "OK", fill=green, font=mid)
+    draw.text((45, 84), "EN FONCTIONNEMENT", fill=white, font=small)
+    draw.text((28, 118), f"CPU {cpu:>3.0f} %", fill=white, font=small)
+    draw.text((28, 142), f"RAM {used_gb:.1f}/{total_gb:.0f} Go", fill=white, font=small)
+    draw.text((224, 142), datetime.now().strftime("%H:%M"), fill=blue, font=small)
+    draw.text((230, 118), "S1 LCD", fill=gray, font=tiny)
     return img
 
 
-def redraw(device_path, image):
-    data = rgb565_swapped(image)
-    total = len(data)
-    seq = 1
-    offset = 0
-
-    while offset < total:
-        chunk = data[offset:offset + PAYLOAD_SIZE]
-        if offset == 0:
-            subcmd = 0xF0
-        elif offset + PAYLOAD_SIZE >= total:
-            subcmd = 0xF2
-        else:
-            subcmd = 0xF1
-
-        off16 = offset & 0xFFFF
-        length_words = len(chunk) // 256  # doc: 0x10 pour 4096, 0x09 pour 2304
-        if len(chunk) % 256:
-            length_words += 1
-
-        header = [
-            0x55, 0xA3, subcmd, seq & 0xFF,
-            off16 & 0xFF, (off16 >> 8) & 0xFF,
-            length_words & 0xFF, (length_words >> 8) & 0xFF,
-        ]
-        write_packet(device_path, packet(header, chunk))
-        offset += len(chunk)
-        seq += 1
-        time.sleep(0.01)
-
-
-
-class UsbWriter:
+class LibUsb1Writer:
     def __init__(self):
-        self.dev = usb.core.find(idVendor=0x04D9, idProduct=0xFD01)
-        if self.dev is None:
+        self.ctx = usb1.USBContext()
+        print("Recherche USB 04D9:FD01", flush=True)
+        self.handle = self.ctx.openByVendorIDAndProductID(VID, PID)
+        if self.handle is None:
             raise RuntimeError("USB 04D9:FD01 introuvable")
-        self.interface = 1
-        self.endpoint = 0x02
         try:
-            if self.dev.is_kernel_driver_active(self.interface):
-                self.dev.detach_kernel_driver(self.interface)
-                print("Kernel driver detache de l'interface USB 1", flush=True)
+            self.handle.detachKernelDriver(INTERFACE)
+            print("Kernel driver detache de l'interface 1", flush=True)
         except Exception as exc:
-            print(f"Info kernel driver interface 1: {exc}", flush=True)
-        try:
-            self.dev.set_configuration()
-        except Exception as exc:
-            print(f"Info set_configuration USB: {exc}", flush=True)
-        usb.util.claim_interface(self.dev, self.interface)
-        print("Peripherique USB selectionne: 04D9:FD01 interface 1 endpoint 0x02", flush=True)
+            print(f"Info detach interface 1: {exc}", flush=True)
+        self.handle.claimInterface(INTERFACE)
+        print("Interface USB 1 revendiquee, endpoint OUT 0x02", flush=True)
 
     def write(self, data):
-        self.dev.write(self.endpoint, data, self.interface, timeout=3000)
+        # Custom HID: pas de report ID, paquet fixe 4104 octets.
+        self.handle.interruptWrite(ENDPOINT_OUT, bytes(data), timeout=3000)
+
+    def close(self):
+        try:
+            self.handle.releaseInterface(INTERFACE)
+        except Exception:
+            pass
+        try:
+            self.handle.close()
+        except Exception:
+            pass
+        try:
+            self.ctx.close()
+        except Exception:
+            pass
 
 
-def write_packet_usb(writer, data):
-    writer.write(data)
+class HidrawWriter:
+    def __init__(self, device):
+        self.device = device
+        if not Path(device).exists():
+            raise FileNotFoundError(device)
+        print(f"HIDRAW utilise: {device}", flush=True)
+
+    def write(self, data):
+        with open(self.device, "wb", buffering=0) as f:
+            f.write(data)
+
+    def close(self):
+        pass
 
 
-def send_orientation_usb(writer, orientation):
-    value = 0x01 if orientation == "landscape" else 0x02
-    write_packet_usb(writer, packet([0x55, 0xA1, 0xF1, value, 0x00, 0x00, 0x00, 0x00]))
-    print(f"Orientation USB envoyee: {orientation}", flush=True)
-
-
-def send_heartbeat_usb(writer):
-    now = datetime.now()
-    write_packet_usb(writer, packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second, 0x00, 0x00]))
-
-
-def redraw_usb(writer, image):
-    data = rgb565_swapped(image)
-    total = len(data)
-    seq = 1
-    offset = 0
-    while offset < total:
-        chunk = data[offset:offset + PAYLOAD_SIZE]
-        if offset == 0:
-            subcmd = 0xF0
-        elif offset + PAYLOAD_SIZE >= total:
-            subcmd = 0xF2
-        else:
-            subcmd = 0xF1
-        off16 = offset & 0xFFFF
-        length_words = len(chunk) // 256
-        if len(chunk) % 256:
-            length_words += 1
-        header = [0x55, 0xA3, subcmd, seq & 0xFF, off16 & 0xFF, (off16 >> 8) & 0xFF, length_words & 0xFF, (length_words >> 8) & 0xFF]
-        write_packet_usb(writer, packet(header, chunk))
-        offset += len(chunk)
-        seq += 1
-        time.sleep(0.01)
-
-def main():
-    opts = load_options()
-    refresh = max(2, int(opts.get("refresh_seconds", 10)))
-    orientation = opts.get("orientation", "landscape")
+def send_orientation(writer, orientation):
     if orientation == "auto":
         orientation = "landscape"
+    value = 0x01 if orientation == "landscape" else 0x02
+    writer.write(packet([0x55, 0xA1, 0xF1, value]))
+    print(f"Orientation envoyee: {orientation}", flush=True)
 
-    backend = opts.get("backend", "usb")
-    print(f"Rafraichissement: {refresh} s", flush=True)
+
+def send_heartbeat(writer):
+    now = datetime.now()
+    writer.write(packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second]))
+
+
+def send_image(writer, image, endian="be"):
+    data = rgb565_be(image) if endian == "be" else rgb565_le(image)
+    total_chunks = (len(data) + PAYLOAD_SIZE - 1) // PAYLOAD_SIZE
+    offset = 0
+    seq = 0
+    while offset < len(data):
+        chunk = data[offset:offset + PAYLOAD_SIZE]
+        # Format simple documente par les projets communautaires: 55 A3 + index + total + longueur + padding.
+        header = [
+            0x55, 0xA3,
+            seq & 0xFF,
+            total_chunks & 0xFF,
+            len(chunk) & 0xFF,
+            (len(chunk) >> 8) & 0xFF,
+            0x00,
+            0x00,
+        ]
+        writer.write(packet(header, chunk))
+        offset += len(chunk)
+        seq += 1
+        time.sleep(0.003)
+
+
+def send_image_alt(writer, image, endian="be"):
+    data = rgb565_be(image) if endian == "be" else rgb565_le(image)
+    offset = 0
+    seq = 1
+    while offset < len(data):
+        chunk = data[offset:offset + PAYLOAD_SIZE]
+        subcmd = 0xF0 if offset == 0 else (0xF2 if offset + PAYLOAD_SIZE >= len(data) else 0xF1)
+        off16 = offset & 0xFFFF
+        blocks = (len(chunk) + 255) // 256
+        header = [0x55, 0xA3, subcmd, seq & 0xFF, off16 & 0xFF, (off16 >> 8) & 0xFF, blocks & 0xFF, (blocks >> 8) & 0xFF]
+        writer.write(packet(header, chunk))
+        offset += len(chunk)
+        seq += 1
+        time.sleep(0.003)
+
+
+def main():
+    print("ACEMAGIC S1 Status - demarrage v1.0.5", flush=True)
+    print("Peripheriques HID disponibles:", flush=True)
+    os.system("ls -l /dev/hidraw* 2>/dev/null || true")
+
+    opts = load_options()
+    refresh = max(1, int(opts.get("refresh_seconds", 2)))
+    orientation = opts.get("orientation", "landscape")
+    backend = opts.get("backend", "libusb1")
     print(f"Backend: {backend}", flush=True)
+    print(f"Rafraichissement: {refresh} s", flush=True)
 
-    if backend == "usb":
-        writer = UsbWriter()
-        try:
-            send_orientation_usb(writer, orientation)
-            time.sleep(0.2)
-        except Exception as exc:
-            print(f"Orientation USB non envoyee: {exc}", flush=True)
+    if backend == "hidraw":
+        writer = HidrawWriter(opts.get("hidraw_device", "/dev/hidraw1"))
+    else:
+        writer = LibUsb1Writer()
+
+    try:
+        send_orientation(writer, orientation)
+        time.sleep(0.2)
         while True:
             try:
-                send_heartbeat_usb(writer)
                 img = make_image()
-                redraw_usb(writer, img)
-                send_heartbeat_usb(writer)
-                print("Image envoyee au LCD via USB", flush=True)
+                send_heartbeat(writer)
+                # Les firmwares S1 ne reagissent pas tous au meme header: on envoie les deux variantes.
+                send_image(writer, img, endian="be")
+                time.sleep(0.1)
+                send_image_alt(writer, img, endian="be")
+                send_heartbeat(writer)
+                print("Image envoyee au LCD", flush=True)
             except Exception as exc:
-                print(f"Erreur LCD USB: {exc}", flush=True)
+                print(f"Erreur LCD: {type(exc).__name__}: {exc}", flush=True)
             time.sleep(refresh)
-
-    device = detect_hidraw(opts.get("hidraw_device", "auto"))
-    try:
-        send_orientation(device, orientation)
-        time.sleep(0.2)
-    except Exception as exc:
-        print(f"Orientation HID non envoyee: {exc}", flush=True)
-    while True:
-        try:
-            send_heartbeat(device)
-            img = make_image()
-            redraw(device, img)
-            send_heartbeat(device)
-            print("Image envoyee au LCD via hidraw", flush=True)
-        except Exception as exc:
-            print(f"Erreur LCD HID: {exc}", flush=True)
-        time.sleep(refresh)
+    finally:
+        writer.close()
 
 
 if __name__ == "__main__":

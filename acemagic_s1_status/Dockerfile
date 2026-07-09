@@ -9,7 +9,7 @@ RUN apk add --no-cache \
     libusb \
     font-dejavu
 
-RUN pip3 install --no-cache-dir --break-system-packages pyusb
+RUN pip3 install --no-cache-dir --break-system-packages libusb1
 
 COPY run.sh /
 COPY app.py /

@@ -11,3 +11,7 @@ Affichage prévu :
 - Heure
 
 Matériel ciblé : écran LCD USB HID `04D9:FD01` du ACEMAGIC S1.
+
+
+## v1.0.3
+Ajout du mode USB direct libusb sur interface 1 / endpoint 0x02.

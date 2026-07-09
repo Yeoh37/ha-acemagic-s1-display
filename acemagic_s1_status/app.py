@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 
 import psutil
+import usb.core
+import usb.util
 from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 320
@@ -21,6 +23,7 @@ def load_options():
         "refresh_seconds": 10,
         "hidraw_device": "auto",
         "orientation": "landscape",
+        "backend": "usb",
     }
     try:
         with open("/data/options.json", "r", encoding="utf-8") as f:
@@ -147,6 +150,69 @@ def redraw(device_path, image):
         time.sleep(0.01)
 
 
+
+class UsbWriter:
+    def __init__(self):
+        self.dev = usb.core.find(idVendor=0x04D9, idProduct=0xFD01)
+        if self.dev is None:
+            raise RuntimeError("USB 04D9:FD01 introuvable")
+        self.interface = 1
+        self.endpoint = 0x02
+        try:
+            if self.dev.is_kernel_driver_active(self.interface):
+                self.dev.detach_kernel_driver(self.interface)
+                print("Kernel driver detache de l'interface USB 1", flush=True)
+        except Exception as exc:
+            print(f"Info kernel driver interface 1: {exc}", flush=True)
+        try:
+            self.dev.set_configuration()
+        except Exception as exc:
+            print(f"Info set_configuration USB: {exc}", flush=True)
+        usb.util.claim_interface(self.dev, self.interface)
+        print("Peripherique USB selectionne: 04D9:FD01 interface 1 endpoint 0x02", flush=True)
+
+    def write(self, data):
+        self.dev.write(self.endpoint, data, self.interface, timeout=3000)
+
+
+def write_packet_usb(writer, data):
+    writer.write(data)
+
+
+def send_orientation_usb(writer, orientation):
+    value = 0x01 if orientation == "landscape" else 0x02
+    write_packet_usb(writer, packet([0x55, 0xA1, 0xF1, value, 0x00, 0x00, 0x00, 0x00]))
+    print(f"Orientation USB envoyee: {orientation}", flush=True)
+
+
+def send_heartbeat_usb(writer):
+    now = datetime.now()
+    write_packet_usb(writer, packet([0x55, 0xA1, 0xF2, now.hour, now.minute, now.second, 0x00, 0x00]))
+
+
+def redraw_usb(writer, image):
+    data = rgb565_swapped(image)
+    total = len(data)
+    seq = 1
+    offset = 0
+    while offset < total:
+        chunk = data[offset:offset + PAYLOAD_SIZE]
+        if offset == 0:
+            subcmd = 0xF0
+        elif offset + PAYLOAD_SIZE >= total:
+            subcmd = 0xF2
+        else:
+            subcmd = 0xF1
+        off16 = offset & 0xFFFF
+        length_words = len(chunk) // 256
+        if len(chunk) % 256:
+            length_words += 1
+        header = [0x55, 0xA3, subcmd, seq & 0xFF, off16 & 0xFF, (off16 >> 8) & 0xFF, length_words & 0xFF, (length_words >> 8) & 0xFF]
+        write_packet_usb(writer, packet(header, chunk))
+        offset += len(chunk)
+        seq += 1
+        time.sleep(0.01)
+
 def main():
     opts = load_options()
     refresh = max(2, int(opts.get("refresh_seconds", 10)))
@@ -154,24 +220,43 @@ def main():
     if orientation == "auto":
         orientation = "landscape"
 
-    device = detect_hidraw(opts.get("hidraw_device", "auto"))
+    backend = opts.get("backend", "usb")
     print(f"Rafraichissement: {refresh} s", flush=True)
+    print(f"Backend: {backend}", flush=True)
 
+    if backend == "usb":
+        writer = UsbWriter()
+        try:
+            send_orientation_usb(writer, orientation)
+            time.sleep(0.2)
+        except Exception as exc:
+            print(f"Orientation USB non envoyee: {exc}", flush=True)
+        while True:
+            try:
+                send_heartbeat_usb(writer)
+                img = make_image()
+                redraw_usb(writer, img)
+                send_heartbeat_usb(writer)
+                print("Image envoyee au LCD via USB", flush=True)
+            except Exception as exc:
+                print(f"Erreur LCD USB: {exc}", flush=True)
+            time.sleep(refresh)
+
+    device = detect_hidraw(opts.get("hidraw_device", "auto"))
     try:
         send_orientation(device, orientation)
         time.sleep(0.2)
     except Exception as exc:
-        print(f"Orientation non envoyee: {exc}", flush=True)
-
+        print(f"Orientation HID non envoyee: {exc}", flush=True)
     while True:
         try:
             send_heartbeat(device)
             img = make_image()
             redraw(device, img)
             send_heartbeat(device)
-            print("Image envoyee au LCD", flush=True)
+            print("Image envoyee au LCD via hidraw", flush=True)
         except Exception as exc:
-            print(f"Erreur LCD: {exc}", flush=True)
+            print(f"Erreur LCD HID: {exc}", flush=True)
         time.sleep(refresh)
 
 

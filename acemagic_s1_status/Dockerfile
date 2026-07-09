@@ -5,6 +5,7 @@ RUN apk add --no-cache \
     python3 \
     py3-pillow \
     py3-psutil \
+    py3-pyusb \
     font-dejavu
 
 COPY run.sh /
